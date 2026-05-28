@@ -25,7 +25,13 @@ def _using_kv_store(vllm_config) -> bool:
 
 @classmethod
 def verify_and_update_config(cls, vllm_config) -> None:
-    """更新混合 Attention/Mamba 模型配置，不再强制两类 cache 的页大小一致。"""
+    """
+    Update Hybrid Attention/Mamba cache configuration without forcing
+    attention and Mamba cache page sizes to be equal.
+
+    Args:
+        vllm_config: vLLM configuration.
+    """
     using_kv_store_with_hybrid = not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager and _using_kv_store(
         vllm_config
     )
