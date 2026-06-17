@@ -58,9 +58,20 @@
  
      const int64_t *runModePtr = attrs->GetAttrPointer<int64_t>(ATTR_RUN_MODE_INDEX);
      attrInfo.runMode = (runModePtr == nullptr) ? 0 : *runModePtr;
-     OP_CHECK_IF(attrInfo.runMode != 0 && attrInfo.runMode != 1, OP_LOGE(context, "runMode only supports 0/1"),
-                 return ge::GRAPH_FAILED);
-     return ge::GRAPH_SUCCESS;
+    OP_CHECK_IF(attrInfo.runMode != 0 && attrInfo.runMode != 1, OP_LOGE(context, "runMode only supports 0/1"),
+                return ge::GRAPH_FAILED);
+
+    const int64_t *convStateStride0Ptr = attrs->GetAttrPointer<int64_t>(ATTR_CONV_STATE_STRIDE_0);
+    attrInfo.convStateStride0 = (convStateStride0Ptr == nullptr) ? 0 : *convStateStride0Ptr;
+    OP_CHECK_IF(attrInfo.convStateStride0 <= 0, OP_LOGE(context, "convStateStride0 must > 0"),
+                return ge::GRAPH_FAILED);
+
+    const int64_t *convStateStride1Ptr = attrs->GetAttrPointer<int64_t>(ATTR_CONV_STATE_STRIDE_1);
+    attrInfo.convStateStride1 = (convStateStride1Ptr == nullptr) ? 0 : *convStateStride1Ptr;
+    OP_CHECK_IF(attrInfo.convStateStride1 <= 0, OP_LOGE(context, "convStateStride1 must > 0"),
+                return ge::GRAPH_FAILED);
+
+    return ge::GRAPH_SUCCESS;
  }
  
  inline ge::graphStatus ValidateAlignedDim(gert::TilingContext *context, int64_t dim)

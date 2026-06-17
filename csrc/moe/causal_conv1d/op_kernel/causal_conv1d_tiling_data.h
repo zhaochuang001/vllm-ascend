@@ -59,6 +59,8 @@ struct CausalConv1dTilingData {
     int64_t numAcceptedTokensUseInt64;
     int64_t tokenBlockSize;
     int64_t tokenBlockCnt;
+    int64_t convStateStride0;
+    int64_t convStateStride1;
     int64_t hasExplicitTokenSeqRanges;
     int64_t explicitTokenSeqRangeCount;
     int64_t tokenTileStartSeq[128];

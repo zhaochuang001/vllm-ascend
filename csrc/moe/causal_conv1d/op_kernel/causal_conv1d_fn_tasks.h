@@ -105,9 +105,11 @@
      const int32_t ringStart = MAX_WIDTH - width;
      const int32_t historyStartTok = tileStart - historyCount;
      LocalTensor<T> ring = inBuf.Get<T>();
-     bool hasGmHistoryCopy = false;
-     bool hasVectorInit = false;
-     const int64_t stateBaseOffset = static_cast<int64_t>(cacheIdx) * stateLen * dim + channelStart;
+    bool hasGmHistoryCopy = false;
+    bool hasVectorInit = false;
+    const int64_t convStateStride0 = tilingData_->convStateStride0;
+    const int64_t convStateStride1 = tilingData_->convStateStride1;
+    const int64_t stateBaseOffset = static_cast<int64_t>(cacheIdx) * convStateStride0 + channelStart;
      int64_t xHistoryOffset = static_cast<int64_t>(historyStartTok) * dim + channelStart;
  
      for (int32_t i = 0; i < ringStart; ++i) {
@@ -122,7 +124,7 @@
              hasGmHistoryCopy = true;
          } else if (hasInit) {
              const int32_t statePos = srcTok - seqStart + historyCount;
-             const int64_t stateOffset = stateBaseOffset + static_cast<int64_t>(statePos) * dim;
+            const int64_t stateOffset = stateBaseOffset + static_cast<int64_t>(statePos) * convStateStride1;
              if (tilingData_->hasInitStateWorkspace != 0) {
                  const int64_t snapshotOffset =
                      (static_cast<int64_t>(seq) * historyCount + statePos) * dim + channelStart;
@@ -197,8 +199,10 @@
      const int32_t historyCount = static_cast<int32_t>(tilingData_->width - 1);
      const int32_t batch = tilingData_->batch;
      const bool hasCacheIndices = (tilingData_->hasCacheIndices != 0);
-     const bool hasInitialStateMode = (tilingData_->hasInitialStateMode != 0);
-     LocalTensor<T> tmpBuf = inBuf.Get<T>()[0 * MAX_BLOCK_DIM];
+    const bool hasInitialStateMode = (tilingData_->hasInitialStateMode != 0);
+    const int64_t convStateStride0 = tilingData_->convStateStride0;
+    const int64_t convStateStride1 = tilingData_->convStateStride1;
+    LocalTensor<T> tmpBuf = inBuf.Get<T>()[0 * MAX_BLOCK_DIM];
  
      for (int32_t seq = 0; seq < batch; ++seq) {
          if (!ResolveSeqHasInit(seq, hasInitialStateMode)) {
@@ -210,10 +214,10 @@
              continue;
          }
  
-         const int64_t stateBaseOffset = static_cast<int64_t>(cacheIdx) * tilingData_->stateLen * dim + channelStart;
+        const int64_t stateBaseOffset = static_cast<int64_t>(cacheIdx) * convStateStride0 + channelStart;
          const int64_t snapshotBaseOffset = static_cast<int64_t>(seq) * historyCount * dim + channelStart;
          for (int32_t statePos = 0; statePos < historyCount; ++statePos) {
-             const int64_t stateOffset = stateBaseOffset + static_cast<int64_t>(statePos) * dim;
+            const int64_t stateOffset = stateBaseOffset + static_cast<int64_t>(statePos) * convStateStride1;
              const int64_t snapshotOffset = snapshotBaseOffset + static_cast<int64_t>(statePos) * dim;
              DataCopy(tmpBuf, convStatesGm[stateOffset], baseDimSize);
              SetFlag<HardEvent::MTE2_MTE3>(initSnapshotMte2ToMte3Event_);

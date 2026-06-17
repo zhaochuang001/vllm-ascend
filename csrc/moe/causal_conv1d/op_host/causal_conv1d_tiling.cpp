@@ -38,6 +38,10 @@
      CausalConv1dAttrInfo attrInfo;
      OP_CHECK_IF(GetAttrsInfo(context, attrInfo) != ge::GRAPH_SUCCESS, OP_LOGE(context, "GetAttrsInfo error"),
                  return ge::GRAPH_FAILED);
+
+    tiling->convStateStride0 = attrInfo.convStateStride0;
+    tiling->convStateStride1 = attrInfo.convStateStride1;
+
      bool hasBias = false;
      OP_CHECK_IF(GetShapeDtypeInfo(context, attrInfo, *tiling, hasBias) != ge::GRAPH_SUCCESS,
                  OP_LOGE(context, "GetShapeDtypeInfo error"), return ge::GRAPH_FAILED);
