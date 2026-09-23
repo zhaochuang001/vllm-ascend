@@ -1184,6 +1184,14 @@ def _reshape_kv_cache_v2(
                 kv_cache_spec.head_size,
                 cache_dtype,
             )
+            if len(kv_cache_shape) == 5 and kv_cache_shape[0] == 2:
+                kv_cache_shape = (
+                    2,
+                    kernel_num_blocks,
+                    kv_cache_spec.num_kv_heads,
+                    kernel_block_size,
+                    kv_cache_spec.head_size,
+                )
             sparse_sfa_c8 = enable_sfa(vllm_config) and bool(getattr(kv_cache_spec, "cache_sparse_sfa_c8", False))
             if isinstance(kv_cache_spec, (AscendMLAAttentionSpec, MLAAttentionSpec)) and (
                 get_kv_cache_compression_ratio(kv_cache_spec) > 1

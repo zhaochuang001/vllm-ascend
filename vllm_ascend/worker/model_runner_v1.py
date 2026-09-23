@@ -5559,6 +5559,14 @@ class NPUModelRunner(GPUModelRunner):
                         current_kv_cache_spec.num_kv_heads,
                         current_kv_cache_spec.head_size,
                     )
+                    if len(kv_cache_shape) == 5 and kv_cache_shape[0] == 2:
+                        kv_cache_shape = (
+                            2,
+                            num_blocks * block_size_chunk,
+                            current_kv_cache_spec.num_kv_heads,
+                            kernel_block_size,
+                            current_kv_cache_spec.head_size,
+                        )
                     if (
                         raw_kv_is_combined
                         and len(kv_cache_shape) == 5

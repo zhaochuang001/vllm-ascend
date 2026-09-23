@@ -554,6 +554,55 @@ class TestAscendAttentionBackendImpl(TestBase):
         self.assertEqual(value.shape, (4, 8, 128, 64))
         self.assertEqual(block_size, 128)
 
+    def test_full_graph_workspace_query_keeps_real_strided_cache_for_task(self):
+        shape = (4, 8, 128, 64)
+        lane_size = 8 * 128 * 64
+        backing = torch.empty(4 * 2 * lane_size, dtype=torch.float16)
+        real_stride = (2 * lane_size, 128 * 64, 64, 1)
+        key_cache = torch.as_strided(backing, shape, real_stride)
+        value_cache = torch.as_strided(backing, shape, real_stride, lane_size)
+        self.impl.key_cache = key_cache
+        self.impl.value_cache = value_cache
+        self.impl.use_bnsd_kv_cache = True
+        self.impl.enable_c8_quant = False
+        self.impl._layer_name = "test_layer"
+        self.impl._use_max_workspace_for_fia_graph = False
+        metadata = MagicMock()
+        metadata.attn_state = AscendAttentionState.DecodeOnly
+        metadata.block_tables = torch.zeros((1, 1), dtype=torch.int32)
+        metadata.seq_lens_list = [3]
+        metadata.actual_seq_lengths_q = [1]
+        metadata.num_actual_tokens = 1
+        metadata.causal = True
+        metadata.attn_mask = torch.zeros((128, 128), dtype=torch.bool)
+        query = torch.empty((1, 8, 64))
+        output = torch.empty_like(query)
+
+        with (
+            patch("vllm_ascend.attention.attention_v1._EXTRA_CTX", SimpleNamespace(is_draft_model=False)),
+            patch(
+                "vllm_ascend.attention.attention_v1.get_capture_resource",
+                side_effect=lambda _key, factory, _use_max: factory(),
+            ),
+            patch(
+                "vllm_ascend.attention.attention_v1.torch_npu._npu_fused_infer_attention_score_get_max_workspace",
+                return_value=torch.empty(1, dtype=torch.uint8),
+                create=True,
+            ) as get_workspace,
+            patch("vllm_ascend.attention.attention_v1.register_task") as register_task,
+        ):
+            self.impl.full_graph_fia(query, key_cache, value_cache, metadata, output)
+
+        query_key = get_workspace.call_args.kwargs["key"]
+        query_value = get_workspace.call_args.kwargs["value"]
+        self.assertEqual(query_key.stride(0), lane_size)
+        self.assertEqual(query_value.stride(0), lane_size)
+        self.assertEqual(query_key.data_ptr(), key_cache.data_ptr())
+        self.assertEqual(query_value.data_ptr(), value_cache.data_ptr())
+        task_args = register_task.call_args.args[1]
+        self.assertIs(task_args["key"], key_cache)
+        self.assertIs(task_args["value"], value_cache)
+
     @patch("vllm_ascend.ascend_forward_context.get_forward_context")
     def test_large_head_prefill_uses_device_operator_fallback(self, mock_get_forward_context):
         query = torch.randn(2, 8, FIA_TND_LARGE_HEAD_FALLBACK_HEAD_SIZE)
@@ -708,11 +757,11 @@ class TestAscendAttentionBackendImpl(TestBase):
 
         assert output.shape == (10, 8 * 64)
 
-    @patch("torch_npu.npu_scatter_pa_kv_cache")
+    @patch.object(torch.ops._C_ascend, "npu_scatter_pa_kv_cache", create=True)
     @patch("torch_npu.npu_fused_infer_attention_score")
     @patch("vllm_ascend.ascend_forward_context.get_forward_context")
     def test_forward_fused_infer_attention(
-        self, mock_get_forward_context, mock_npu_fused_infer_attention_score, mock_npu_scatter_pa_kv_cache
+        self, mock_get_forward_context, mock_npu_fused_infer_attention_score, mock_custom_scatter
     ):
         """Test forward pass in PrefillCacheHit state"""
         query = torch.randn(10, 8, 64)
@@ -739,6 +788,7 @@ class TestAscendAttentionBackendImpl(TestBase):
         output = self.impl.forward(layer, query, key, value, kv_cache, metadata, output)
 
         mock_npu_fused_infer_attention_score.assert_called_once()
+        mock_custom_scatter.assert_called_once()
         assert output.shape == (10, 8, 64)
 
     @patch("vllm_ascend.attention.attention_v1._EXTRA_CTX")
@@ -781,9 +831,9 @@ class TestAscendAttentionBackendImpl(TestBase):
 
     @patch("vllm_ascend.ascend_forward_context.get_forward_context")
     @patch("torch_npu.npu_fused_infer_attention_score")
-    @patch("torch_npu.npu_scatter_pa_kv_cache")
+    @patch.object(torch.ops._C_ascend, "npu_scatter_pa_kv_cache", create=True)
     def test_forward_decode_only_swa(
-        self, mock_npu_scatter_pa_kv_cache, mock_fused_infer_attention_score, mock_get_forward_context
+        self, mock_custom_scatter, mock_fused_infer_attention_score, mock_get_forward_context
     ):
         """Test forward pass in DecodeOnly state"""
         query = torch.randn(10, 8 * 64)
@@ -808,6 +858,7 @@ class TestAscendAttentionBackendImpl(TestBase):
         output = self.impl_swa.forward(layer, query, key, value, kv_cache, metadata, output)
         print(output.shape)
         mock_fused_infer_attention_score.assert_called_once()
+        mock_custom_scatter.assert_called_once()
         assert output.shape == (10, 8, 64)
 
     @patch("vllm_ascend.attention.attention_v1._EXTRA_CTX")

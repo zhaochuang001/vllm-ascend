@@ -15,6 +15,7 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import math
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -532,7 +533,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         self.attn_type = attn_type
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
         self.kv_cache_layout = envs_vllm.VLLM_KV_CACHE_LAYOUT
-        self.use_bnsd_kv_cache = self.kv_cache_layout in ("LBHNC", "HND")
+        self.use_bnsd_kv_cache = True
 
         assert self.num_heads % self.num_kv_heads == 0
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
@@ -629,12 +630,20 @@ class AscendAttentionBackendImpl(AttentionImpl):
             sparse_mode = 0
 
         use_max_workspace = self._use_max_workspace_for_fia_graph
+        workspace_key, workspace_value = key, value
+        if self.use_bnsd_kv_cache and not self.enable_c8_quant and key.ndim == value.ndim == 4:
+            # Workspace sizing only needs cache metadata. Keep the real
+            # strided views in the registered attention task below.
+            key_strides = tuple(math.prod(key.shape[dim + 1 :]) for dim in range(key.ndim))
+            value_strides = tuple(math.prod(value.shape[dim + 1 :]) for dim in range(value.ndim))
+            workspace_key = key.as_strided(key.shape, key_strides)
+            workspace_value = value.as_strided(value.shape, value_strides)
         workspace = get_capture_resource(
             _FIA_WORKSPACE_KEY,
             lambda: torch_npu._npu_fused_infer_attention_score_get_max_workspace(
                 query=query,
-                key=key,
-                value=value,
+                key=workspace_key,
+                value=workspace_value,
                 atten_mask=attn_mask,
                 block_table=block_table,
                 input_layout=input_layout,
