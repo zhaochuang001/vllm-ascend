@@ -1384,17 +1384,22 @@ def is_c8_mxfp_kv_quant(vllm_config: VllmConfig) -> bool:
     return vllm_config.cache_config.cache_dtype == C8_MXFP_KV_CACHE_DTYPE
 
 
+def is_minimax_m3_model(vllm_config: VllmConfig | None) -> bool:
+    """Identify MiniMax-M3 from the source-of-truth HF architectures."""
+    model_config = getattr(vllm_config, "model_config", None)
+    architectures = getattr(getattr(model_config, "hf_config", None), "architectures", None) or ()
+    return any(
+        architecture in ("MiniMaxM3SparseForCausalLM", "MiniMaxM3SparseForConditionalGeneration")
+        for architecture in architectures
+    )
+
+
 def is_minimax_m3_fp8_kv_cache(vllm_config: VllmConfig | None) -> bool:
     if vllm_config is None:
         return False
-    model_config = vllm_config.model_config
     cache_config = vllm_config.cache_config
-    architectures = getattr(getattr(model_config, "hf_config", None), "architectures", None) or ()
     return (
-        any(
-            architecture in ("MiniMaxM3SparseForCausalLM", "MiniMaxM3SparseForConditionalGeneration")
-            for architecture in architectures
-        )
+        is_minimax_m3_model(vllm_config)
         and cache_config is not None
         and cache_config.cache_dtype in ("fp8", "fp8_e4m3")
         and bool(cache_config.kv_cache_dtype_skip_layers)

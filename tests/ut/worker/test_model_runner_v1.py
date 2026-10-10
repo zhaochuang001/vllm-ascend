@@ -2,6 +2,7 @@ import unittest
 from collections import deque
 from contextlib import nullcontext
 from dataclasses import fields, replace
+from itertools import product
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -1302,6 +1303,146 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
     def test_pure_gqa_uses_noncontiguous_block_major_kv_cache(self):
         self._check_gqa_cache_layout(xlite_enabled=False)
 
+    def test_minimax_m3_all_cache_views_are_contiguous(self):
+        """Check all M3 cache kinds, mixed dtypes, padding, and write isolation."""
+        from vllm_ascend.models.minimax_m3.minimax_m3 import MiniMaxM3SparseAttention
+        from vllm_ascend.models.minimax_m3.msa_m3 import (
+            AscendMiniMaxM3IndexerBackend,
+            AscendMiniMaxM3IndexerCache,
+            AscendMiniMaxM3SparseBackend,
+        )
+
+        architectures = ("MiniMaxM3SparseForCausalLM", "MiniMaxM3SparseForConditionalGeneration")
+        for architecture, fp8, block_size, padding in product(architectures, (False, True), (128, 256), (0, 64)):
+            with self.subTest(architecture=architecture, fp8=fp8, block_size=block_size, padding=padding):
+                runner = self._build_runner()
+                runner.model_config = SimpleNamespace(
+                    hf_config=SimpleNamespace(architectures=[architecture]), use_mla=False
+                )
+                runner.vllm_config = SimpleNamespace(
+                    model_config=runner.model_config,
+                    cache_config=SimpleNamespace(
+                        cache_dtype="fp8" if fp8 else "auto",
+                        block_size=block_size,
+                        kv_cache_dtype_skip_layers=["1"] if fp8 else [],
+                    ),
+                    compilation_config=SimpleNamespace(static_forward_context={}),
+                    kv_transfer_config=None,
+                    quant_config=None,
+                )
+                sparse_dtype = torch.float8_e4m3fn if fp8 else torch.bfloat16
+                msa_name = "model.layers.0.self_attn.attn"
+                gqa_name = "model.layers.1.attention"
+                indexer_name = msa_name + ".index_cache"
+                msa_layer = MiniMaxM3SparseAttention.__new__(MiniMaxM3SparseAttention)
+                torch.nn.Module.__init__(msa_layer)
+                msa_layer.num_kv_heads = 1
+                msa_layer.head_dim = 128
+                msa_layer.kv_cache_dtype = "fp8" if fp8 else "auto"
+                msa_layer.kv_cache_torch_dtype = sparse_dtype
+                msa_spec = msa_layer.get_kv_cache_spec(runner.vllm_config)
+                indexer_layer = AscendMiniMaxM3IndexerCache.__new__(AscendMiniMaxM3IndexerCache)
+                torch.nn.Module.__init__(indexer_layer)
+                indexer_layer.head_dim = 128
+                indexer_layer.dtype = sparse_dtype
+                indexer_layer.kv_cache_dtype = "fp8" if fp8 else "auto"
+                indexer_spec = indexer_layer.get_kv_cache_spec(runner.vllm_config)
+                gqa_spec = FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=128,
+                    dtype=torch.bfloat16,
+                )
+                if padding:
+                    msa_spec = replace(msa_spec, page_size_padded=msa_spec.real_page_size_bytes + padding)
+                    gqa_spec = replace(gqa_spec, page_size_padded=gqa_spec.real_page_size_bytes + padding)
+                specs = {msa_name: msa_spec, gqa_name: gqa_spec, indexer_name: indexer_spec}
+                backends = {
+                    msa_name: AscendMiniMaxM3SparseBackend,
+                    gqa_name: AscendAttentionBackend,
+                    indexer_name: AscendMiniMaxM3IndexerBackend,
+                }
+                config = KVCacheConfig(
+                    num_blocks=2,
+                    kv_cache_tensors=[
+                        _make_kv_cache_tensor(2 * spec.page_size_bytes, [name], spec.page_size_bytes)
+                        for name, spec in specs.items()
+                    ],
+                    kv_cache_groups=[
+                        KVCacheGroupSpec(layer_names=[name], kv_cache_spec=spec) for name, spec in specs.items()
+                    ],
+                )
+                runner._kv_cache_spec_attn_group_iterator = lambda specs=specs, backends=backends: iter(
+                    SimpleNamespace(
+                        kv_cache_group_id=index,
+                        kv_cache_spec=spec,
+                        backend=backends[name],
+                        layer_names=[name],
+                    )
+                    for index, (name, spec) in enumerate(specs.items())
+                )
+                kernel_sizes = [128, 64 if fp8 else 128, 128]
+
+                raw = runner._allocate_kv_cache_tensors(config)
+                caches = runner._reshape_kv_cache_tensors(config, raw, kernel_sizes)
+                storage_ptrs = set()
+                for name, spec in specs.items():
+                    assert isinstance(raw[name], tuple)
+                    assert len(raw[name]) == len(caches[name]) == (1 if name == indexer_name else 2)
+                    assert sum(tensor.numel() for tensor in raw[name]) == 2 * spec.page_size_bytes
+                    for tensor, raw_tensor in zip(caches[name], raw[name]):
+                        assert raw_tensor.is_contiguous() and tensor.is_contiguous()
+                        assert tensor.dtype == spec.dtype
+                        assert tensor.data_ptr() == raw_tensor.data_ptr()
+                        assert tensor.untyped_storage().data_ptr() == raw_tensor.untyped_storage().data_ptr()
+                        storage_ptrs.add(raw_tensor.untyped_storage().data_ptr())
+                    if name == indexer_name:
+                        assert caches[name][0].shape == (2, block_size, 128)
+                    else:
+                        kernel_size = 64 if name == gqa_name and fp8 else 128
+                        expected_shape = (2 * spec.block_size // kernel_size, kernel_size, 1, 128)
+                        assert caches[name][0].shape == caches[name][1].shape == expected_shape
+                assert len(storage_ptrs) == 5
+
+                key, value = caches[gqa_name]
+                key[0].copy_(torch.full(key[0].shape, 3, dtype=torch.bfloat16))
+                value[1].copy_(torch.full(value[1].shape, 5, dtype=torch.bfloat16))
+                assert torch.count_nonzero(key[1].float()) == 0
+                assert torch.count_nonzero(value[0].float()) == 0
+                for name in (msa_name, indexer_name):
+                    assert all(torch.count_nonzero(tensor.float()) == 0 for tensor in caches[name])
+                msa_key, msa_value = caches[msa_name]
+                msa_key[0].copy_(torch.full(msa_key[0].shape, 7, dtype=torch.float32).to(sparse_dtype))
+                assert torch.count_nonzero(msa_value.float()) == 0
+                assert torch.count_nonzero(msa_key[1].float()) == 0
+                assert torch.all(key[0] == 3) and torch.all(value[1] == 5)
+                indexer_cache = caches[indexer_name][0]
+                indexer_bytes = indexer_cache.view(torch.uint8).view(-1)
+                indexer_block_bytes = block_size * 128 * indexer_cache.element_size()
+                indexer_bytes[indexer_block_bytes] = 23
+                assert raw[indexer_name][0][indexer_block_bytes].item() == 23
+                assert torch.count_nonzero(indexer_bytes[:indexer_block_bytes]) == 0
+                assert torch.all(msa_key[0].float() == 7)
+                assert torch.count_nonzero(msa_value.float()) == 0
+                if padding:
+                    for name in (msa_name, gqa_name):
+                        for tensor, raw_tensor in zip(caches[name], raw[name]):
+                            logical_size = tensor.numel() * tensor.element_size()
+                            assert torch.count_nonzero(raw_tensor[logical_size:]) == 0
+
+    def test_minimax_m3_rejects_mxfp8_kv_before_allocation(self):
+        for architecture in ("MiniMaxM3SparseForCausalLM", "MiniMaxM3SparseForConditionalGeneration"):
+            with self.subTest(architecture=architecture):
+                runner = self._build_runner()
+                runner.vllm_config.model_config.hf_config.architectures = [architecture]
+                runner.vllm_config.cache_config.cache_dtype = "mxfp8"
+                with (
+                    patch("vllm_ascend.worker.model_runner_v1.torch.zeros") as allocate,
+                    self.assertRaisesRegex(ValueError, "MiniMax-M3 does not support mxfp8 KV cache"),
+                ):
+                    runner._allocate_kv_cache_tensors(runner.kv_cache_config)
+                allocate.assert_not_called()
+
     def test_paged_attention_uses_contiguous_kv_cache(self):
         self._check_gqa_cache_layout(xlite_enabled=False, pa_enabled=True)
 
@@ -1322,6 +1463,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         runner.dcp_size = dcp_size
         runner.ascend_config.xlite_graph_config.enabled = xlite_enabled
         runner.model_config.use_mla = False
+        runner.vllm_config.model_config.hf_config.architectures = ["Qwen3ForCausalLM"]
         layer_name = "model.layers.0.self_attn.attn"
         spec = FullAttentionSpec(
             block_size=8,

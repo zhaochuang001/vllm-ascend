@@ -93,7 +93,9 @@ from vllm_ascend.utils import (
     enable_sfa,
     enable_sfa_dcp_replicated_indexer,
     get_kv_cache_tensor_layers,
+    is_c8_mxfp_kv_quant,
     is_hidden_state_cache_spec,
+    is_minimax_m3_model,
     kv_cache_spec_uses_packed_sfa_main_cache,
 )
 from vllm_ascend.worker.kvpp_cache import allocate_kvpp_cache
@@ -888,6 +890,9 @@ def _allocate_kv_cache(
         Raw cache tensors or K/V tensor pairs, indexed by layer name.
     """
     vllm_config = get_current_vllm_config()
+    is_m3_model = is_minimax_m3_model(vllm_config)
+    if is_m3_model and is_c8_mxfp_kv_quant(vllm_config):
+        raise ValueError("MiniMax-M3 does not support packed mxfp8 KV cache.")
     if KVPPConfig.from_vllm_config(vllm_config).size > 1:
         caches = allocate_kvpp_cache(vllm_config, kv_cache_config, device)
         specs = _get_layer_kv_cache_specs(kv_cache_config)
@@ -1172,10 +1177,11 @@ def _allocate_kv_cache(
                     (backend is None or not backend.is_sparse())
                     and not use_dcp
                     and not requires_contiguous_pa_kv_cache(layer, vllm_config, layer_spec)
+                    and not is_m3_model
                 ):
                     kv_cache_raw_tensors[layer_name] = _allocate_int8_cache_tensor(layer_size, alignment, device)
                     continue
-                if layer_spec.page_size_bytes != layer_spec.real_page_size_bytes:
+                if layer_spec.page_size_bytes != layer_spec.real_page_size_bytes and not is_m3_model:
                     raise ValueError(
                         f"Sparse Attention backend for {layer_name} requires "
                         "unpadded FullAttention pages for contiguous K/V cache."
@@ -1311,6 +1317,7 @@ def _reshape_kv_cache_v2(
 
     vllm_config = get_current_vllm_config()
     is_dsv4_model = _is_dsv4_model(vllm_config)
+    is_m3_model = is_minimax_m3_model(vllm_config)
     layer_kv_cache_spec = _get_layer_kv_cache_specs(kv_cache_config)
     kv_caches: dict[str, Any] = {}
     layer_tuple_strides: dict[str, int] = {}
@@ -1639,6 +1646,18 @@ def _reshape_kv_cache_v2(
                 kv_caches[layer_name] = (k_cache,)
             elif isinstance(raw_cache, tuple):
                 raw_k_tensor, raw_v_tensor = raw_cache
+                if (
+                    is_m3_model
+                    and type(kv_cache_spec) is FullAttentionSpec
+                    and kv_cache_spec.page_size_bytes != kv_cache_spec.real_page_size_bytes
+                ):
+                    # Preserve physical-page capacity, then expose dense logical K/V.
+                    k_bytes = math.prod(k_shape) * get_dtype_size(k_dtype)
+                    v_bytes = math.prod(v_shape) * get_dtype_size(v_dtype)
+                    if raw_k_tensor.numel() < k_bytes or raw_v_tensor.numel() < v_bytes:
+                        raise ValueError("Padded MiniMax-M3 K/V allocation is smaller than its logical cache.")
+                    raw_k_tensor = raw_k_tensor[:k_bytes]
+                    raw_v_tensor = raw_v_tensor[:v_bytes]
                 k_cache = raw_k_tensor.view(k_dtype).view(k_shape)
                 v_cache = raw_v_tensor.view(v_dtype).view(v_shape)
                 kv_caches[layer_name] = (k_cache, v_cache)

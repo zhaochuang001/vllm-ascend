@@ -50,6 +50,8 @@ from vllm_ascend.device.hardware_profile import get_hardware_profile
 from vllm_ascend.models.deepseek_v4 import compressor as deepseek_v4_compressor
 from vllm_ascend.models.deepseek_v4 import indexer as deepseek_v4_indexer
 from vllm_ascend.models.deepseek_v4 import model as deepseek_v4_model
+from vllm_ascend.models.minimax_m3 import msa_m3 as minimax_m3_module
+from vllm_ascend.models.minimax_m3.minimax_m3 import MiniMaxM3SparseAttention
 from vllm_ascend.patch.platform.patch_kv_cache_utils import (
     _get_kv_cache_config_deepseek_v4_main,
 )
@@ -237,6 +239,170 @@ def test_main_allocator_attention_layout(
     assert torch.count_nonzero(value_cache[3:]) == 0
     assert torch.count_nonzero(second_key) == 0
     assert torch.count_nonzero(second_value) == 0
+
+
+@pytest.mark.parametrize("architecture", ["MiniMaxM3SparseForCausalLM", "MiniMaxM3SparseForConditionalGeneration"])
+@pytest.mark.parametrize("fp8", [False, True])
+@pytest.mark.parametrize("padded", [False, True])
+@pytest.mark.parametrize("dense_kernel_block_size", [64, 128])
+@pytest.mark.parametrize("kv_transfer", [False, True])
+def test_minimax_m3_allocates_contiguous_dense_sparse_and_indexer_cache(
+    monkeypatch, architecture, fp8, padded, dense_kernel_block_size, kv_transfer
+):
+    """Preserve physical capacity while exposing independent dense M3 cache views."""
+    dense_name = "model.layers.0.self_attn.attn"
+    sparse_name = "model.layers.1.self_attn.attn"
+    indexer_name = sparse_name + ".index_cache"
+    block_size, head_size, num_blocks = 128, 128, 3
+    sparse_dtype = torch.float8_e4m3fn if fp8 else torch.bfloat16
+    vllm_config = SimpleNamespace(
+        additional_config={},
+        kv_transfer_config=object() if kv_transfer else None,
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=[architecture]), use_mla=False, dtype=torch.bfloat16
+        ),
+        cache_config=SimpleNamespace(
+            block_size=block_size, cache_dtype="fp8" if fp8 else "auto", kv_cache_dtype_skip_layers=["0"] if fp8 else []
+        ),
+        compilation_config=SimpleNamespace(static_forward_context={}),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        quant_config=None,
+    )
+    monkeypatch.setattr(attn_utils, "get_current_vllm_config", lambda: vllm_config)
+    monkeypatch.setattr(minimax_m3_module, "get_current_vllm_config", lambda: vllm_config)
+    monkeypatch.setattr(attn_utils, "enable_sfa", lambda *_args: False)
+    monkeypatch.setattr(attn_utils, "enable_fa_quant", lambda *_args: False)
+    sparse_layer = MiniMaxM3SparseAttention.__new__(MiniMaxM3SparseAttention)
+    torch.nn.Module.__init__(sparse_layer)
+    sparse_layer.num_heads = 4
+    sparse_layer.num_kv_heads = 1
+    sparse_layer.head_dim = head_size
+    sparse_layer.kv_cache_dtype = "fp8" if fp8 else "auto"
+    sparse_layer.kv_cache_torch_dtype = sparse_dtype
+    sparse_layer.attn_backend = minimax_m3_module.AscendMiniMaxM3SparseBackend
+    indexer_layer = minimax_m3_module.AscendMiniMaxM3IndexerCache(
+        head_size, indexer_name, vllm_config.cache_config, sparse_layer.kv_cache_dtype, sparse_dtype
+    )
+    dense_spec = FullAttentionSpec(block_size=block_size, num_kv_heads=1, head_size=head_size, dtype=torch.bfloat16)
+    sparse_spec = sparse_layer.get_kv_cache_spec(vllm_config)
+    if padded:
+        dense_spec = replace(dense_spec, page_size_padded=2 * dense_spec.page_size_bytes)
+        sparse_spec = replace(sparse_spec, page_size_padded=2 * sparse_spec.page_size_bytes)
+    indexer_spec = indexer_layer.get_kv_cache_spec(vllm_config)
+    specs = {dense_name: dense_spec, sparse_name: sparse_spec, indexer_name: indexer_spec}
+    impl = AscendAttentionBackendImpl.__new__(AscendAttentionBackendImpl)
+    impl.sliding_window = None
+    layers = {
+        dense_name: SimpleNamespace(get_attn_backend=lambda: AscendAttentionBackend, impl=impl),
+        sparse_name: sparse_layer,
+        indexer_name: indexer_layer,
+    }
+    monkeypatch.setattr(attn_utils, "get_layers_from_vllm_config", lambda *_args: layers)
+    config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[
+            _make_kv_cache_tensor(num_blocks * spec.page_size_bytes, [name], spec.page_size_bytes)
+            for name, spec in specs.items()
+        ],
+        kv_cache_groups=[KVCacheGroupSpec(layer_names=[name], kv_cache_spec=spec) for name, spec in specs.items()],
+    )
+    raw = attn_utils._allocate_kv_cache(config, {}, torch.device("cpu"))
+    assert all(isinstance(raw[name], tuple) for name in specs)
+    assert all(
+        sum(part.numel() for part in raw[name]) == num_blocks * spec.page_size_bytes for name, spec in specs.items()
+    )
+    groups = [
+        AttentionGroup(
+            backend=layers[name].get_attn_backend(),
+            layer_names=[name],
+            kv_cache_spec=spec,
+            kv_cache_group_id=group_id,
+        )
+        for group_id, (name, spec) in enumerate(specs.items())
+    ]
+    caches = attn_utils._reshape_kv_cache_v2(
+        groups, raw, vllm_config.cache_config.cache_dtype, [dense_kernel_block_size, block_size, block_size], {}, config
+    )
+    dense_key, dense_value = caches[dense_name]
+    sparse_key, sparse_value = caches[sparse_name]
+    (indexer_key,) = caches[indexer_name]
+    assert (
+        dense_key.shape
+        == dense_value.shape
+        == (num_blocks * block_size // dense_kernel_block_size, dense_kernel_block_size, 1, head_size)
+    )
+    assert sparse_key.shape == sparse_value.shape == (num_blocks, block_size, 1, head_size)
+    assert indexer_key.shape == (num_blocks, block_size, head_size)
+    assert dense_key.dtype == dense_value.dtype == torch.bfloat16
+    assert sparse_key.dtype == sparse_value.dtype == indexer_key.dtype == sparse_dtype
+    views = [dense_key, dense_value, sparse_key, sparse_value, indexer_key]
+    assert all(cache.is_contiguous() for cache in views)
+    assert len({cache.untyped_storage().data_ptr() for cache in views}) == len(views)
+    for name, spec in specs.items():
+        assert (
+            sum(cache.numel() * cache.element_size() for cache in caches[name])
+            == num_blocks * spec.real_page_size_bytes
+        )
+        for raw_part, cache in zip(raw[name], caches[name]):
+            assert cache.data_ptr() == raw_part.data_ptr()
+            assert raw_part.untyped_storage().nbytes() == raw_part.numel() + (2 * 1024 * 1024 if kv_transfer else 0)
+            if kv_transfer:
+                assert cache.data_ptr() % (2 * 1024 * 1024) == 0
+    for marker, cache in enumerate(views, start=1):
+        cache_bytes = cache.view(torch.uint8)
+        cache_bytes[1].fill_(marker)
+        assert torch.all(cache_bytes[1] == marker)
+        assert torch.count_nonzero(cache_bytes[0]) == 0
+        assert torch.count_nonzero(cache_bytes[2:]) == 0
+    for name in specs:
+        for raw_part, cache in zip(raw[name], caches[name]):
+            assert torch.count_nonzero(raw_part[cache.numel() * cache.element_size() :]) == 0
+
+
+@pytest.mark.parametrize("padded", [False, True])
+def test_non_minimax_m3_dense_cache_keeps_combined_layout(monkeypatch, padded):
+    name = "model.layers.0.self_attn.attn"
+    spec = FullAttentionSpec(block_size=2, num_kv_heads=1, head_size=4, dtype=torch.bfloat16)
+    if padded:
+        spec = replace(spec, page_size_padded=2 * spec.page_size_bytes)
+    config = KVCacheConfig(
+        num_blocks=3,
+        kv_cache_tensors=[_make_kv_cache_tensor(3 * spec.page_size_bytes, [name], spec.page_size_bytes)],
+        kv_cache_groups=[KVCacheGroupSpec(layer_names=[name], kv_cache_spec=spec)],
+    )
+    model_config = SimpleNamespace(hf_config=SimpleNamespace(architectures=["Qwen3ForCausalLM"]), use_mla=False)
+    vllm_config = SimpleNamespace(
+        additional_config={},
+        model_config=model_config,
+        cache_config=SimpleNamespace(cache_dtype="auto"),
+        kv_transfer_config=None,
+    )
+    layer = SimpleNamespace(get_attn_backend=lambda: AscendAttentionBackend)
+    monkeypatch.setattr(attn_utils, "get_current_vllm_config", lambda: vllm_config)
+    monkeypatch.setattr(attn_utils, "get_layers_from_vllm_config", lambda *_args: {name: layer})
+    monkeypatch.setattr(attn_utils, "enable_sfa", lambda *_args: False)
+    raw = attn_utils._allocate_kv_cache(config, {}, torch.device("cpu"))
+    assert isinstance(raw[name], torch.Tensor)
+    group = AttentionGroup(backend=AscendAttentionBackend, layer_names=[name], kv_cache_spec=spec, kv_cache_group_id=0)
+    key, value = attn_utils._reshape_kv_cache_v2([group], raw, "auto", [2], {}, config)[name]
+    assert key.shape == value.shape == (3, 2, 1, 4)
+    assert not key.is_contiguous() and not value.is_contiguous()
+    assert key.stride(0) == value.stride(0) == spec.page_size_bytes // spec.dtype.itemsize
+    assert key.untyped_storage().data_ptr() == value.untyped_storage().data_ptr() == raw[name].data_ptr()
+
+
+@pytest.mark.parametrize("architecture", ["MiniMaxM3SparseForCausalLM", "MiniMaxM3SparseForConditionalGeneration"])
+def test_minimax_m3_rejects_packed_mxfp8_kv_cache(monkeypatch, architecture):
+    config = SimpleNamespace(
+        additional_config={},
+        kv_transfer_config=None,
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(architectures=[architecture])),
+        cache_config=SimpleNamespace(cache_dtype="mxfp8"),
+    )
+    monkeypatch.setattr(attn_utils, "get_current_vllm_config", lambda: config)
+    cache_config = KVCacheConfig(num_blocks=1, kv_cache_tensors=[], kv_cache_groups=[])
+    with pytest.raises(ValueError, match="MiniMax-M3 does not support packed mxfp8 KV cache"):
+        attn_utils._allocate_kv_cache(cache_config, {}, torch.device("cpu"))
 
 
 def test_sparse_offload_allocator_uses_host_main_cache_and_device_resident_buffer(monkeypatch):
